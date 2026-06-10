@@ -32,9 +32,36 @@ class CausalSelfAttention(nn.Module):
     return proj
 
   def attention(self, key, query, value, attention_mask):
+    d_k = query.size(-1)
 
-    ### YOUR CODE HERE
-    raise NotImplementedError
+    # 1. Scaled dot-product: Q·K^T / sqrt(d_k)  →  [bs, num_heads, seq_len, seq_len]
+    attention_scores = torch.matmul(query, key.transpose(-2, -1)) / (d_k ** 0.5)
+
+    # 2. Causal mask: zero out (set to -inf) positions above the diagonal
+    #    so each token can only attend to itself and earlier tokens
+    seq_len = query.size(-2)
+    causal_mask = torch.triu(
+      torch.ones(seq_len, seq_len, device=query.device, dtype=torch.bool),
+      diagonal=1,
+    )
+    attention_scores.masked_fill_(causal_mask, float('-inf'))
+
+    # 3. Padding mask: attention_mask is [bs, 1, 1, seq_len], already converted
+    #    by get_extended_attention_mask (0.0 for real tokens, -10000.0 for padding)
+    attention_scores = attention_scores + attention_mask
+
+    # 4. Softmax over the key (last) dimension
+    attention_probs = torch.softmax(attention_scores, dim=-1)
+
+    # 5. Dropout on attention probabilities
+    attention_probs = self.dropout(attention_probs)
+
+    # 6. Weighted sum: probs · V  →  [bs, num_heads, seq_len, head_dim]
+    context = torch.matmul(attention_probs, value)
+
+    # 7. Concatenate heads: [bs, num_heads, seq_len, head_dim] → [bs, seq_len, hidden_size]
+    context = rearrange(context, 'b h t d -> b t (h d)')
+    return context
 
 
   def forward(self, hidden_states, attention_mask):

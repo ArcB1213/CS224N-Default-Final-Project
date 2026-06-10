@@ -12,6 +12,7 @@ trains and evaluates your ParaphraseGPT model and writes the required submission
 '''
 
 import argparse
+import os
 import random
 import torch
 
@@ -50,7 +51,9 @@ class ParaphraseGPT(nn.Module):
 
   def __init__(self, args):
     super().__init__()
-    self.gpt = GPT2Model.from_pretrained(model=args.model_size, d=args.d, l=args.l, num_heads=args.num_heads)
+    local_path = f'{args.model_size}_pretrained'
+    model_name = local_path if os.path.isdir(local_path) else args.model_size
+    self.gpt = GPT2Model.from_pretrained(model=model_name, d=args.d, l=args.l, num_heads=args.num_heads)
     self.paraphrase_detection_head = nn.Linear(args.d, 2)  # Paraphrase detection has two outputs: 1 (yes) or 0 (no).
 
     # By default, fine-tune the full model.
@@ -59,20 +62,19 @@ class ParaphraseGPT(nn.Module):
 
   def forward(self, input_ids, attention_mask):
     """
-    TODO: Predict the label of the token using the paraphrase_detection_head Linear layer.
+    Cloze-style paraphrase detection: predict "yes" or "no" as the next token.
 
-    We structure the input as:
-
-      'Is "{s1}" a paraphrase of "{s2}"? Answer "yes" or "no": '
-
-    So you want to find the prediction for the next token at the end of this sentence. Optimistically, it will be the
-    token "yes" (byte pair encoding index of 8505) for examples that are paraphrases or "no" (byte pair encoding index
-     of 3919) for examples that are not paraphrases.
+    Uses hidden_state_to_token to get vocabulary logits, then extracts
+    the logits for "yes" (token 8505) and "no" (token 3919).
+    Returns [bs, 2] where index 0 = "no", index 1 = "yes".
     """
+    gpt_output = self.gpt(input_ids=input_ids, attention_mask=attention_mask)
+    last_token = gpt_output['last_token']  # [bs, hidden_size]
 
-    'Takes a batch of sentences and produces embeddings for them.'
-    ### YOUR CODE HERE
-    raise NotImplementedError
+    # Get logits over the full vocabulary, then extract yes/no
+    vocab_logits = self.gpt.hidden_state_to_token(last_token)  # [bs, vocab_size]
+    logits = torch.stack([vocab_logits[:, 3919], vocab_logits[:, 8505]], dim=1)  # [bs, 2]
+    return logits
 
 
 
@@ -177,12 +179,12 @@ def test(args):
   with open(args.para_dev_out, "w+") as f:
     f.write(f"id \t Predicted_Is_Paraphrase \n")
     for p, s in zip(dev_para_sent_ids, dev_para_y_pred):
-      f.write(f"{p}, {s} \n")
+      f.write(f"{p}, {8505 if s == 1 else 3919} \n")
 
   with open(args.para_test_out, "w+") as f:
     f.write(f"id \t Predicted_Is_Paraphrase \n")
     for p, s in zip(test_para_sent_ids, test_para_y_pred):
-      f.write(f"{p}, {s} \n")
+      f.write(f"{p}, {8505 if s == 1 else 3919} \n")
 
 
 def get_args():

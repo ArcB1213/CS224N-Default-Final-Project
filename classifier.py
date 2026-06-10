@@ -43,7 +43,7 @@ class GPT2SentimentClassifier(torch.nn.Module):
   def __init__(self, config):
     super(GPT2SentimentClassifier, self).__init__()
     self.num_labels = config.num_labels
-    self.gpt = GPT2Model.from_pretrained()
+    self.gpt = GPT2Model.from_pretrained(model='gpt2_pretrained')
 
     # Pretrain mode does not require updating GPT paramters.
     assert config.fine_tune_mode in ["last-linear-layer", "full-model"]
@@ -69,7 +69,7 @@ class SentimentDataset(Dataset):
   def __init__(self, dataset, args):
     self.dataset = dataset
     self.p = args
-    self.tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
+    self.tokenizer = GPT2Tokenizer.from_pretrained('gpt2_pretrained')
     self.tokenizer.pad_token = self.tokenizer.eos_token
 
   def __len__(self):
@@ -108,7 +108,7 @@ class SentimentTestDataset(Dataset):
   def __init__(self, dataset, args):
     self.dataset = dataset
     self.p = args
-    self.tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
+    self.tokenizer = GPT2Tokenizer.from_pretrained('gpt2_pretrained')
     self.tokenizer.pad_token = self.tokenizer.eos_token
 
   def __len__(self):

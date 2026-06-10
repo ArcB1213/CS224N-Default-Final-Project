@@ -8,6 +8,7 @@ trains your SonnetGPT model and writes the required submission files.
 '''
 
 import argparse
+import os
 import random
 import torch
 
@@ -46,8 +47,10 @@ class SonnetGPT(nn.Module):
 
   def __init__(self, args):
     super().__init__()
-    self.gpt = GPT2Model.from_pretrained(model=args.model_size, d=args.d, l=args.l, num_heads=args.num_heads)
-    self.tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
+    local_path = f'{args.model_size}_pretrained'
+    model_name = local_path if os.path.isdir(local_path) else args.model_size
+    self.gpt = GPT2Model.from_pretrained(model=model_name, d=args.d, l=args.l, num_heads=args.num_heads)
+    self.tokenizer = GPT2Tokenizer.from_pretrained('gpt2_pretrained')
     self.tokenizer.pad_token = self.tokenizer.eos_token
 
     # By default, fine-tune the full model. TODO: this is maybe not idea.

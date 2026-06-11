@@ -152,10 +152,17 @@ class SonnetsDataset(Dataset):
     encoding = self.tokenizer(sonnets, return_tensors='pt', padding=True, truncation=True)
     token_ids = torch.LongTensor(encoding['input_ids'])
     attention_mask = torch.LongTensor(encoding['attention_mask'])
+    target_mask = attention_mask.clone()
+
+    for i, sonnet in enumerate(sonnets):
+      prompt = '\n'.join(sonnet.splitlines()[:3])
+      prompt_len = len(self.tokenizer(prompt, add_special_tokens=False)['input_ids'])
+      target_mask[i, :prompt_len] = 0
 
     batched_data = {
       'token_ids': token_ids,
       'attention_mask': attention_mask,
+      'target_mask': target_mask,
       'sent_ids': idx
     }
 

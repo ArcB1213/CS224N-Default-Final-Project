@@ -20,6 +20,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import GPT2Tokenizer
 from einops import rearrange
+from sacrebleu.metrics import CHRF
 
 from datasets import (
   SonnetsDataset,
@@ -29,6 +30,22 @@ from models.gpt2 import GPT2Model
 from optimizer import AdamW
 
 TQDM_DISABLE = False
+
+
+def count_nonempty_lines(text):
+  return sum(1 for line in text.splitlines() if line.strip())
+
+
+def trim_to_nonempty_lines(text, max_lines):
+  lines = []
+  nonempty_count = 0
+  for line in text.splitlines():
+    if line.strip():
+      nonempty_count += 1
+    if nonempty_count > max_lines:
+      break
+    lines.append(line)
+  return '\n'.join(lines).rstrip()
 
 
 # Fix the random seed.
@@ -59,12 +76,14 @@ class SonnetGPT(nn.Module):
 
   def forward(self, input_ids, attention_mask):
     """
-    This is similar to the forward for ParaphraseGPT, but we now want to produce a logit for each token in our sequence;
-    not just the last token! This will allow our model to learn the natural language distribution that composes sonnets,
-    not just the distribution over next tokens for the last token!
+    Autoregressive LM: produce a logit for EVERY token in the sequence,
+    not just the last one. This lets the model learn the full language
+    distribution of sonnets during training.
     """
-    ### YOUR CODE HERE
-    raise NotImplementedError
+    gpt_output = self.gpt(input_ids=input_ids, attention_mask=attention_mask)
+    hidden_states = gpt_output['last_hidden_state']  # [bs, seq_len, hidden_size]
+    logits = self.gpt.hidden_state_to_token(hidden_states)  # [bs, seq_len, vocab_size]
+    return logits
 
 
   def get_device(self):
@@ -72,37 +91,37 @@ class SonnetGPT(nn.Module):
       return param.device
 
   @torch.no_grad()
-  def generate(self, encoding, temperature=0.7, top_p=0.9, max_length=128):
+  def generate(self, encoding, temperature=0.7, top_p=0.9, max_length=128, max_lines=14):
     """
-    Generates an original sonnet using top-p sampling and softmax temperature.
-
-    TODO: this is probably not ideal. You can look at hugging face's model.generate(...) function for inspiration.
-    In particular, generating multiple sequences and choosing the best with beam search is one avenue. Top_k is another;
-    there are many.
+    Generates an original sonnet using top-p (nucleus) sampling and softmax temperature.
     """
     token_ids = encoding.to(self.get_device())
     attention_mask = torch.ones(token_ids.shape, dtype=torch.int64).to(self.get_device())
 
-
     for _ in range(max_length):
-      # Forward pass to get logits
-      logits_sequence = self.forward(token_ids, attention_mask)
-      logits_last_token = logits_sequence[:, -1, :] / temperature  # Apply temperature scaling
+      decoded_so_far = self.tokenizer.decode(token_ids[0].cpu().numpy().tolist())
+      line_count = count_nonempty_lines(decoded_so_far)
+      if line_count > max_lines:
+        break
 
-      # Convert logits to probabilities
-      probs = torch.nn.functional.softmax(logits_last_token, dim=-1)
+      logits_sequence = self.forward(token_ids, attention_mask)
+      logits_last_token = logits_sequence[:, -1, :] / temperature
+      if line_count < max_lines:
+        logits_last_token[:, self.tokenizer.eos_token_id] = float('-inf')
 
       # Top-p (nucleus) sampling
-      sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+      sorted_logits, sorted_indices = torch.sort(logits_last_token, descending=True)
+      sorted_probs = torch.softmax(sorted_logits, dim=-1)
       cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-      top_p_mask = cumulative_probs <= top_p
-      top_p_mask[..., 1:] = top_p_mask[..., :-1].clone()  # Shift mask right for proper thresholding
-      top_p_mask[..., 0] = True  # Always include the highest probability token
-      filtered_probs = sorted_probs * top_p_mask  # Zero out unlikely tokens
-      filtered_probs /= filtered_probs.sum(dim=-1, keepdim=True)  # Normalize probabilities
 
-      # Sample from filtered distribution
-      sampled_index = torch.multinomial(filtered_probs, 1)
+      # Remove tokens with cumulative probability above the threshold
+      # Keep the first token that exceeds the threshold (so we always have at least 1)
+      sorted_indices_to_remove = cumulative_probs - sorted_probs > top_p
+      sorted_logits[sorted_indices_to_remove] = float('-inf')
+
+      # Sample from the filtered distribution
+      probs = torch.softmax(sorted_logits, dim=-1)
+      sampled_index = torch.multinomial(probs, 1)
       sampled_token = sorted_indices.gather(dim=-1, index=sampled_index)
 
       # Stop if end-of-sequence token is reached
@@ -115,7 +134,8 @@ class SonnetGPT(nn.Module):
         [attention_mask, torch.ones((1, 1), dtype=torch.int64).to(self.get_device())], dim=1
       )
 
-    generated_output = self.tokenizer.decode(token_ids[0].cpu().numpy().tolist())[3:]
+    generated_output = self.tokenizer.decode(token_ids[0].cpu().numpy().tolist())
+    generated_output = trim_to_nonempty_lines(generated_output, max_lines)
     return token_ids, generated_output
 
 
@@ -133,16 +153,79 @@ def save_model(model, optimizer, args, filepath):
   print(f"save the model to {filepath}")
 
 
+def parse_float_list(value, fallback):
+  if value is None or value.strip() == '':
+    return [fallback]
+  return [float(item.strip()) for item in value.split(',') if item.strip()]
+
+
+@torch.no_grad()
+def generate_sonnets(model, held_out_sonnet_dataset, device, temperature, top_p, max_length, max_lines):
+  generated_sonnets = []
+  for sonnet_id, prompt in held_out_sonnet_dataset:
+    encoding = model.tokenizer(prompt, return_tensors='pt', padding=False, truncation=True).to(device)
+    _, decoded_output = model.generate(
+      encoding['input_ids'],
+      temperature=temperature,
+      top_p=top_p,
+      max_length=max_length,
+      max_lines=max_lines
+    )
+    generated_sonnets.append((sonnet_id, f'{decoded_output}\n\n'))
+  return generated_sonnets
+
+
+def score_generated_sonnets(generated_sonnets, gold_path):
+  true_sonnets = [x[1].strip() for x in SonnetsDataset(gold_path)]
+  predicted_sonnets = [x[1].strip() for x in generated_sonnets]
+  max_len = min(len(true_sonnets), len(predicted_sonnets))
+  chrf_score = CHRF().corpus_score(predicted_sonnets[:max_len], [true_sonnets[:max_len]])
+  return float(chrf_score.score)
+
+
+@torch.no_grad()
+def evaluate_generation_grid(model, dev_dataset, args, device, temperatures, top_ps):
+  if not args.dev_gold_sonnet_path or not os.path.exists(args.dev_gold_sonnet_path):
+    print(f"Skipping dev chrF: gold file not found at {args.dev_gold_sonnet_path}")
+    return None
+
+  best_score = None
+  best_temperature = temperatures[0]
+  best_top_p = top_ps[0]
+  best_sonnets = None
+
+  for temperature in temperatures:
+    for top_p in top_ps:
+      generated_sonnets = generate_sonnets(
+        model,
+        dev_dataset,
+        device,
+        temperature=temperature,
+        top_p=top_p,
+        max_length=args.max_gen_length,
+        max_lines=args.max_sonnet_lines
+      )
+      score = score_generated_sonnets(generated_sonnets, args.dev_gold_sonnet_path)
+      print(f"dev chrF @ temperature={temperature:g}, top_p={top_p:g}: {score:.3f}")
+      if best_score is None or score > best_score:
+        best_score = score
+        best_temperature = temperature
+        best_top_p = top_p
+        best_sonnets = generated_sonnets
+
+  return best_score, best_temperature, best_top_p, best_sonnets
+
+
 def train(args):
-  """Train GPT-2 for paraphrase detection on the Quora dataset."""
+  """Fine-tune GPT-2 for sonnet continuation."""
   device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
   # Create the data and its corresponding datasets and dataloader.
   sonnet_dataset = SonnetsDataset(args.sonnet_path)
   sonnet_dataloader = DataLoader(sonnet_dataset, shuffle=True, batch_size=args.batch_size,
                                  collate_fn=sonnet_dataset.collate_fn)
 
-  # Create the held-out dataset: these only have the first 3 lines. Your job is to fill in the rest!
-  held_out_sonnet_dataset = SonnetsDataset(args.held_out_sonnet_path)
+  # Dev prompts have the first 3 lines and paired gold sonnets for local tuning.
+  dev_sonnet_dataset = SonnetsDataset(args.dev_held_out_sonnet_path)
 
   args = add_arguments(args)
   model = SonnetGPT(args)
@@ -150,6 +233,12 @@ def train(args):
 
   lr = args.lr
   optimizer = AdamW(model.parameters(), lr=lr)
+  temperatures = parse_float_list(args.temperature_grid, args.temperature)
+  top_ps = parse_float_list(args.top_p_grid, args.top_p)
+  best_dev_chrf = None
+  best_temperature = args.temperature
+  best_top_p = args.top_p
+  best_checkpoint_path = None
 
   # Run for the specified number of epochs.
   for epoch in range(args.epochs):
@@ -160,15 +249,26 @@ def train(args):
     for batch in tqdm(sonnet_dataloader, desc=f'train-{epoch}', disable=TQDM_DISABLE):
       # Get the input and move it to the gpu (I do not recommend training this model on CPU).
       b_ids, b_mask = batch['token_ids'], batch['attention_mask']
+      b_target_mask = batch['target_mask']
       b_ids = b_ids.to(device)
       b_mask = b_mask.to(device)
+      b_target_mask = b_target_mask.to(device)
 
       # Compute the loss, gradients, and update the model's parameters.
       optimizer.zero_grad()
       logits = model(b_ids, b_mask)
-      logits = rearrange(logits[:, :-1].contiguous(), 'b t d -> (b t) d')  # Ignore the last prediction in the sequence.
-      labels = b_ids[:, 1:].contiguous().flatten()  # Ignore the first token to compose the labels.
-      loss = F.cross_entropy(logits, labels, reduction='mean')
+      # Shift: logits predict next token, so align predictions with targets
+      shift_logits = logits[:, :-1].contiguous()  # [bs, seq_len-1, vocab]
+      shift_labels = b_ids[:, 1:].contiguous()     # [bs, seq_len-1]
+      shift_mask = b_target_mask[:, 1:].contiguous()  # ignore padding and the conditioning prompt
+
+      loss = F.cross_entropy(
+        rearrange(shift_logits, 'b t d -> (b t) d'),
+        shift_labels.flatten(),
+        reduction='none',
+      )
+      # Mask out padding positions before averaging
+      loss = (loss * shift_mask.flatten()).sum() / shift_mask.flatten().sum()
       loss.backward()
       optimizer.step()
 
@@ -177,21 +277,52 @@ def train(args):
 
     train_loss = train_loss / num_batches
     print(f"Epoch {epoch}: train loss :: {train_loss :.3f}.")
-    print('Generating several output sonnets...')
     model.eval()
-    for batch in held_out_sonnet_dataset:
-      encoding = model.tokenizer(batch[1], return_tensors='pt', padding=True, truncation=True).to(device)
-      output = model.generate(encoding['input_ids'], temperature=args.temperature, top_p=args.top_p)
-      print(f'{batch[1]}{output[1]}\n\n')
+    dev_result = None
+    if args.eval_every > 0 and (epoch + 1) % args.eval_every == 0:
+      dev_result = evaluate_generation_grid(model, dev_sonnet_dataset, args, device, temperatures, top_ps)
 
-    # TODO: consider a stopping condition to prevent overfitting on the small dataset of sonnets.
+    if dev_result is not None:
+      dev_chrf, dev_temperature, dev_top_p, dev_sonnets = dev_result
+      if best_dev_chrf is None or dev_chrf > best_dev_chrf:
+        best_dev_chrf = dev_chrf
+        best_temperature = dev_temperature
+        best_top_p = dev_top_p
+        best_checkpoint_path = f'best_{args.filepath}'
+        args.temperature = best_temperature
+        args.top_p = best_top_p
+        save_model(model, optimizer, args, best_checkpoint_path)
+      print(
+        f"Epoch {epoch}: best dev chrF this epoch :: {dev_chrf:.3f} "
+        f"(temperature={dev_temperature:g}, top_p={dev_top_p:g})."
+      )
+      print(
+        f"Best dev chrF so far :: {best_dev_chrf:.3f} "
+        f"(temperature={best_temperature:g}, top_p={best_top_p:g})."
+      )
+      print('Sample dev generations:')
+      for _, sonnet in dev_sonnets[:args.dev_preview_count]:
+        print(f'{sonnet}\n')
+
+    # Save only the latest checkpoint (delete previous to save disk space)
     save_model(model, optimizer, args, f'{epoch}_{args.filepath}')
+    if epoch > 0:
+      prev_path = f'{epoch-1}_{args.filepath}'
+      if os.path.exists(prev_path):
+        os.remove(prev_path)
+
+  if best_checkpoint_path is not None:
+    args.checkpoint_path = best_checkpoint_path
+    args.temperature = best_temperature
+    args.top_p = best_top_p
+  return best_temperature, best_top_p
 
 
 @torch.no_grad()
 def generate_submission_sonnets(args):
   device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
-  saved = torch.load(f'{args.epochs-1}_{args.filepath}', weights_only=False)
+  checkpoint_path = getattr(args, 'checkpoint_path', f'{args.epochs-1}_{args.filepath}')
+  saved = torch.load(checkpoint_path, weights_only=False)
 
   model = SonnetGPT(saved['args'])
   model.load_state_dict(saved['model'])
@@ -201,17 +332,21 @@ def generate_submission_sonnets(args):
   # Create the held-out dataset: these only have the first 3 lines. Your job is to fill in the rest!
   held_out_sonnet_dataset = SonnetsDataset(args.held_out_sonnet_path)
 
-  generated_sonnets = []
-  for batch in held_out_sonnet_dataset:
-    sonnet_id = batch[0]
-    encoding = model.tokenizer(batch[1], return_tensors='pt', padding=False, truncation=True).to(device)
-    output = model.generate(encoding['input_ids'], temperature=args.temperature, top_p=args.top_p)[0][0]
-    decoded_output = model.tokenizer.decode(output)
-    full_sonnet = f'{decoded_output}\n\n'
-    generated_sonnets.append((sonnet_id, full_sonnet))
+  generated_sonnets = generate_sonnets(
+    model,
+    held_out_sonnet_dataset,
+    device,
+    temperature=args.temperature,
+    top_p=args.top_p,
+    max_length=args.max_gen_length,
+    max_lines=args.max_sonnet_lines
+  )
+  for _, sonnet in generated_sonnets:
+    print(sonnet)
 
-    print(f'{decoded_output}\n\n')
-
+  sonnet_out_dir = os.path.dirname(args.sonnet_out)
+  if sonnet_out_dir:
+    os.makedirs(sonnet_out_dir, exist_ok=True)
   with open(args.sonnet_out, "w+") as f:
     f.write(f"--Generated Sonnets-- \n\n")
     for sonnet in generated_sonnets:
@@ -224,6 +359,8 @@ def get_args():
 
   parser.add_argument("--sonnet_path", type=str, default="data/sonnets.txt")
   parser.add_argument("--held_out_sonnet_path", type=str, default="data/sonnets_held_out.txt")
+  parser.add_argument("--dev_held_out_sonnet_path", type=str, default="data/sonnets_held_out_dev.txt")
+  parser.add_argument("--dev_gold_sonnet_path", type=str, default="data/TRUE_sonnets_held_out_dev.txt")
   parser.add_argument("--sonnet_out", type=str, default="predictions/generated_sonnets.txt")
 
   parser.add_argument("--seed", type=int, default=11711)
@@ -234,6 +371,14 @@ def get_args():
   parser.add_argument("--temperature", type=float, help="softmax temperature.", default=1.2)
   parser.add_argument("--top_p", type=float, help="Cumulative probability distribution for nucleus sampling.",
                       default=0.9)
+  parser.add_argument("--temperature_grid", type=str, default="",
+                      help="Comma-separated temperatures for dev chrF search. Defaults to --temperature only.")
+  parser.add_argument("--top_p_grid", type=str, default="",
+                      help="Comma-separated top-p values for dev chrF search. Defaults to --top_p only.")
+  parser.add_argument("--max_gen_length", type=int, default=128)
+  parser.add_argument("--max_sonnet_lines", type=int, default=14)
+  parser.add_argument("--eval_every", type=int, default=1)
+  parser.add_argument("--dev_preview_count", type=int, default=2)
 
   parser.add_argument("--batch_size", help='The training batch size.', type=int, default=8)
   parser.add_argument("--lr", type=float, help="learning rate", default=1e-5)

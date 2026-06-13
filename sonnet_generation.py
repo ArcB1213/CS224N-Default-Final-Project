@@ -48,6 +48,34 @@ def trim_to_nonempty_lines(text, max_lines):
   return '\n'.join(lines).rstrip()
 
 
+def apply_repetition_penalty(logits, token_ids, repetition_penalty):
+  if repetition_penalty <= 1.0:
+    return
+
+  for batch_idx in range(logits.size(0)):
+    seen_tokens = set(token_ids[batch_idx].tolist())
+    for token_id in seen_tokens:
+      if logits[batch_idx, token_id] < 0:
+        logits[batch_idx, token_id] *= repetition_penalty
+      else:
+        logits[batch_idx, token_id] /= repetition_penalty
+
+
+def banned_ngram_tokens(token_ids, no_repeat_ngram_size):
+  if no_repeat_ngram_size <= 0 or token_ids.size(1) + 1 < no_repeat_ngram_size:
+    return []
+
+  tokens = token_ids[0].tolist()
+  prefix_len = no_repeat_ngram_size - 1
+  current_prefix = tuple(tokens[-prefix_len:])
+  banned = []
+  for i in range(len(tokens) - no_repeat_ngram_size + 1):
+    ngram = tokens[i:i + no_repeat_ngram_size]
+    if tuple(ngram[:-1]) == current_prefix:
+      banned.append(ngram[-1])
+  return banned
+
+
 # Fix the random seed.
 def seed_everything(seed=11711):
   random.seed(seed)
@@ -91,7 +119,8 @@ class SonnetGPT(nn.Module):
       return param.device
 
   @torch.no_grad()
-  def generate(self, encoding, temperature=0.7, top_p=0.9, max_length=128, max_lines=14):
+  def generate(self, encoding, temperature=0.7, top_p=0.9, max_length=128, max_lines=14,
+               repetition_penalty=1.0, no_repeat_ngram_size=0):
     """
     Generates an original sonnet using top-p (nucleus) sampling and softmax temperature.
     """
@@ -108,6 +137,9 @@ class SonnetGPT(nn.Module):
       logits_last_token = logits_sequence[:, -1, :] / temperature
       if line_count < max_lines:
         logits_last_token[:, self.tokenizer.eos_token_id] = float('-inf')
+      apply_repetition_penalty(logits_last_token, token_ids, repetition_penalty)
+      for banned_token_id in banned_ngram_tokens(token_ids, no_repeat_ngram_size):
+        logits_last_token[:, banned_token_id] = float('-inf')
 
       # Top-p (nucleus) sampling
       sorted_logits, sorted_indices = torch.sort(logits_last_token, descending=True)
@@ -160,7 +192,8 @@ def parse_float_list(value, fallback):
 
 
 @torch.no_grad()
-def generate_sonnets(model, held_out_sonnet_dataset, device, temperature, top_p, max_length, max_lines):
+def generate_sonnets(model, held_out_sonnet_dataset, device, temperature, top_p, max_length, max_lines,
+                     repetition_penalty=1.0, no_repeat_ngram_size=0):
   generated_sonnets = []
   for sonnet_id, prompt in held_out_sonnet_dataset:
     encoding = model.tokenizer(prompt, return_tensors='pt', padding=False, truncation=True).to(device)
@@ -169,7 +202,9 @@ def generate_sonnets(model, held_out_sonnet_dataset, device, temperature, top_p,
       temperature=temperature,
       top_p=top_p,
       max_length=max_length,
-      max_lines=max_lines
+      max_lines=max_lines,
+      repetition_penalty=repetition_penalty,
+      no_repeat_ngram_size=no_repeat_ngram_size
     )
     generated_sonnets.append((sonnet_id, f'{decoded_output}\n\n'))
   return generated_sonnets
@@ -203,7 +238,9 @@ def evaluate_generation_grid(model, dev_dataset, args, device, temperatures, top
         temperature=temperature,
         top_p=top_p,
         max_length=args.max_gen_length,
-        max_lines=args.max_sonnet_lines
+        max_lines=args.max_sonnet_lines,
+        repetition_penalty=args.repetition_penalty,
+        no_repeat_ngram_size=args.no_repeat_ngram_size
       )
       score = score_generated_sonnets(generated_sonnets, args.dev_gold_sonnet_path)
       print(f"dev chrF @ temperature={temperature:g}, top_p={top_p:g}: {score:.3f}")
@@ -339,7 +376,9 @@ def generate_submission_sonnets(args):
     temperature=args.temperature,
     top_p=args.top_p,
     max_length=args.max_gen_length,
-    max_lines=args.max_sonnet_lines
+    max_lines=args.max_sonnet_lines,
+    repetition_penalty=args.repetition_penalty,
+    no_repeat_ngram_size=args.no_repeat_ngram_size
   )
   for _, sonnet in generated_sonnets:
     print(sonnet)
@@ -377,6 +416,8 @@ def get_args():
                       help="Comma-separated top-p values for dev chrF search. Defaults to --top_p only.")
   parser.add_argument("--max_gen_length", type=int, default=128)
   parser.add_argument("--max_sonnet_lines", type=int, default=14)
+  parser.add_argument("--repetition_penalty", type=float, default=1.0)
+  parser.add_argument("--no_repeat_ngram_size", type=int, default=0)
   parser.add_argument("--eval_every", type=int, default=1)
   parser.add_argument("--dev_preview_count", type=int, default=2)
 

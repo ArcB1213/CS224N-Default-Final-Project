@@ -22,11 +22,15 @@
 - train split 的 judge 结果用于构造 DPO 训练数据。
 - dev/test split 的 judge 结果用于评估，不用于构造训练偏好数据。
 - DPO 数据以 `prompt / chosen / rejected` 形式保存，并保留 judge 分数和元数据，方便后续分析。
-- `my_results/`、checkpoint、候选生成结果和 API 返回 JSONL 都属于运行产物，不进入 git commit。
+- 候选、评审 JSONL、日志和 checkpoint 都属于本地运行产物，不进入 git commit。下文使用相对路径链接到当前工作区中的实验存档。
+
+本轮 train 存档包含 131 个 prompt、1,048 个候选和 393 条偏好对。按 `prompt_id` 可以从候选追到评审排序，再用 `chosen_id` 和 `rejected_id` 核对配对。[训练候选](../my_results-small/llm_judge/candidates_train.jsonl) · [评审请求](../my_results-small/llm_judge/judge_requests_train.jsonl) · [评审排序](../my_results-small/llm_judge/judgments_train.jsonl) · [DPO 训练偏好对](../my_results-small/llm_judge/dpo_pairs_train.jsonl)
+
+另有从 SFT 候选中选诗的评审记录，包括 [dev 候选](../my_results-small/candidates_dev.jsonl)、[dev 候选排序](../my_results-small/judgments_dev.jsonl)和 [dev 重排结果](../my_results-small/reranked_dev_sonnets.txt)。这些记录没有后续作用了，当时之所以要对dev和test集也做deepseek的打分实验，应该是为了检验Deepseek对生成结果的评价是否合理，属于进行正式DPO实验前的准备工作。
 
 ## DPO 之前的 SFT 调试结果
 
-在进入 LLM-as-a-Judge 和 DPO 之前，sonnet generation 已经完成了基础 SFT 训练和 dev chrF 网格搜索。最后一个 epoch 的日志保存在 `my_results/sonnet-training-log.txt`，关键结果如下：
+在进入 LLM-as-a-Judge 和 DPO 之前，sonnet generation 已经完成了基础 SFT 训练和 dev chrF 网格搜索。本节的训练损失、dev 网格搜索和生成样例都可以在 [GPT-2 small 的 SFT 日志](../my_results-small/sonnet-training-log.txt) 中找到。
 
 | 指标                     |                        结果 |
 | ------------------------ | --------------------------: |
@@ -58,7 +62,7 @@
 - 长距离语义经常漂移，后半首和前三行 prompt 的主题连接会变弱。
 - 有些句子语法不稳定，局部短语看起来像莎诗，但整句不一定通顺。
 - 会出现不自然或离题的实体和意象，例如和 sonnet 风格不太协调的人名、动物或叙事片段。
-- 部分输出存在重复、空行、格式松散或结尾收束不佳的问题。
+- 部分输出存在重复、空行、格式松散或结尾收束不佳的问题。可查看 [SFT 日志中的 Sample dev generations](../my_results-small/sonnet-training-log.txt)。
 - chrF 能反映和参考答案的重叠程度，但很难评价这些主观质量问题。
 
 因此，DPO 之前的结论是：基础 SFT 已经完成了可用的初步实现，但如果目标是更像“人会觉得更好的 sonnet”，单靠 train loss 和 chrF 不够。后续引入 LLM-as-a-Judge 的主要动机，就是把风格、连贯性、流畅度、诗歌形式和重复退化这些 chrF 不容易覆盖的维度纳入优化和评估。
@@ -83,6 +87,8 @@ DPO 训练时，虽然 `chosen` 和 `rejected` 文本已经生成好了，但模
 | 0     |         0.5633 |                0.846 |       0.3945 |                     0.917 |
 | 1     |         0.4141 |                0.836 |       0.2785 |                     0.917 |
 
+上表来自当时的实验汇总。当前工作区保留了 [DPO 训练偏好对](../my_results-small/llm_judge/dpo_pairs_train.jsonl)，暂未找到对应的逐轮训练日志或 dev 偏好对文件，因此暂无法从原始记录复核表中的 loss 和 preference accuracy。
+
 ## 初版 DPO 评估结果
 
 在未加入 repetition control 时，DPO 在 LLM judge 的 pairwise 评估中明显优于 SFT，但 dev chrF 略低于 SFT：
@@ -93,6 +99,8 @@ DPO 训练时，虽然 `chosen` 和 `rejected` 文本已经生成好了，但模
 | Test  |        9 |        2 |    1 |                     0.7917 |                       0.8182 |      N/A |      N/A |
 
 这个结果说明 DPO 确实学到了 judge 偏好，但它并不必然提高 chrF。人工查看 SFT 获胜的样例后，主要问题集中在 DPO 有时会出现重复和退化，比如围绕 love、judgement、beauty 之类抽象词反复展开。
+
+本节的胜负、chrF 和样例观察来自当时的实验汇总。当前工作区暂未找到未加 repetition control 这一轮的逐样本盲评记录。
 
 ## 加入 Repetition Control 后
 
@@ -113,6 +121,10 @@ DPO 训练时，虽然 `chosen` 和 `rejected` 文本已经生成好了，但模
 | ----- | -------: | -------: | ---: | -------------------------: | ---------------------------: | -------: | -------: |
 | Dev   |        6 |        1 |    5 |                     0.7083 |                       0.8571 |  41.9863 |  42.3278 |
 | Test  |        5 |        0 |    7 |                     0.7083 |                       1.0000 |      N/A |      N/A |
+
+两份盲评记录各有 12 条，可以用 `winner_model` 复核胜负和平局，用 `sft_text`、`dpo_text` 和 `brief_rationale` 查看两首诗和评审理由。[Dev 盲评明细](../my_results-small/dpo_eval/pairwise_judgments_dev.jsonl) · [Test 盲评明细](../my_results-small/dpo_eval/pairwise_judgments_test.jsonl)
+
+Dev chrF 可用盲评记录里的两组生成文本和 [dev 参考原诗](../data/TRUE_sonnets_held_out_dev.txt) 复算。解码参数沿用本节的历史记录，盲评 JSONL 保存的是生成结果和判定。
 
 ## 结果解读
 

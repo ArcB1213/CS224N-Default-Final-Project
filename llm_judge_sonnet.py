@@ -122,8 +122,8 @@ def load_sonnet_model(checkpoint_path, device):
 
 def strip_prompt(full_text, prompt):
   if full_text.startswith(prompt):
-    return full_text[len(prompt):].lstrip()
-  return full_text
+    return full_text[len(prompt):]
+  raise ValueError('Generated sonnet does not begin with the prompt.')
 
 
 @torch.no_grad()
@@ -131,7 +131,8 @@ def generate_candidates_for_prompt(model, prompt_id, prompt, params, args, devic
   records = []
   for candidate_id, (temperature, top_p) in enumerate(params):
     set_generation_seed(args.seed + prompt_id * 1000 + candidate_id)
-    encoding = model.tokenizer(prompt, return_tensors='pt', padding=False, truncation=True).to(device)
+    encoding = model.tokenizer(
+      prompt, add_special_tokens=False, return_tensors='pt', padding=False, truncation=True).to(device)
     _, generated_text = model.generate(
       encoding['input_ids'],
       temperature=temperature,

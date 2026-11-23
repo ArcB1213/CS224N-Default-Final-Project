@@ -48,21 +48,39 @@ class DpoPreferenceDataset(Dataset):
 
 def encode_prompt_completion(tokenizer, prompt, completion, max_length):
   prompt_ids = tokenizer(prompt, add_special_tokens=False)['input_ids']
-  full_ids = tokenizer(prompt + completion, add_special_tokens=False, truncation=True, max_length=max_length)['input_ids']
+  if not prompt_ids:
+    raise ValueError('DPO prompt must contain at least one token.')
+  available = max_length - len(prompt_ids)
+  if available < 1:
+    raise ValueError(f'DPO prompt uses {len(prompt_ids)} tokens and leaves no completion room at max_length={max_length}.')
+  if not completion.strip():
+    raise ValueError('DPO completion must contain text.')
 
-  if len(full_ids) <= len(prompt_ids):
-    full_ids = tokenizer(prompt + '\n' + completion, add_special_tokens=False,
-                         truncation=True, max_length=max_length)['input_ids']
-  prompt_len = min(len(prompt_ids), max(0, len(full_ids) - 1))
-  return full_ids, prompt_len
+  # A continuation starts after the same fixed tokenized prefix used at generation.
+  completion_ids = tokenizer(completion, add_special_tokens=False)['input_ids'][:available]
+  if not completion_ids:
+    raise ValueError('DPO completion must contain at least one token.')
+  return prompt_ids + completion_ids, len(prompt_ids)
+
+
+def get_completion(example, key):
+  full_text = example.get(f'{key}_text')
+  if full_text is None:
+    return example[key]
+  prompt = example['prompt']
+  if not full_text.startswith(prompt):
+    raise ValueError(f'DPO {key}_text does not begin with the prompt (prompt_id={example.get("prompt_id")}).')
+  return full_text[len(prompt):]
 
 
 def collate_dpo_batch(examples, tokenizer, max_length):
   encoded = []
   for example in examples:
     prompt = example['prompt']
-    chosen_ids, chosen_prompt_len = encode_prompt_completion(tokenizer, prompt, example['chosen'], max_length)
-    rejected_ids, rejected_prompt_len = encode_prompt_completion(tokenizer, prompt, example['rejected'], max_length)
+    chosen_ids, chosen_prompt_len = encode_prompt_completion(
+      tokenizer, prompt, get_completion(example, 'chosen'), max_length)
+    rejected_ids, rejected_prompt_len = encode_prompt_completion(
+      tokenizer, prompt, get_completion(example, 'rejected'), max_length)
     encoded.append((chosen_ids, chosen_prompt_len, rejected_ids, rejected_prompt_len))
 
   max_seq_len = max(max(len(item[0]), len(item[2])) for item in encoded)

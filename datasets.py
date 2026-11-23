@@ -122,11 +122,15 @@ def load_paraphrase_data(paraphrase_filename, split='train'):
 
 
 class SonnetsDataset(Dataset):
-  def __init__(self, file_path):
+  def __init__(self, file_path, format_aware_sft=False):
     self.tokenizer = GPT2Tokenizer.from_pretrained('gpt2_pretrained')
 
     self.tokenizer.pad_token = self.tokenizer.eos_token
     self.sonnets = self._load_sonnets(file_path)
+    self.format_aware_sft = format_aware_sft
+    if format_aware_sft:
+      self.sonnets = [sonnet for sonnet in self.sonnets
+                      if sum(bool(line.strip()) for line in sonnet.splitlines()) == 14]
 
   def _load_sonnets(self, file_path):
     """Reads the file and extracts individual sonnets."""
@@ -149,7 +153,9 @@ class SonnetsDataset(Dataset):
     idx = [example[0] for example in all_data]
     sonnets = [example[1] for example in all_data]
 
-    encoding = self.tokenizer(sonnets, return_tensors='pt', padding=True, truncation=True)
+    # An explicit EOS is attended and supervised. EOS tokens used as padding are masked.
+    texts = [sonnet + self.tokenizer.eos_token for sonnet in sonnets] if self.format_aware_sft else sonnets
+    encoding = self.tokenizer(texts, return_tensors='pt', padding=True, truncation=True)
     token_ids = torch.LongTensor(encoding['input_ids'])
     attention_mask = torch.LongTensor(encoding['attention_mask'])
     target_mask = attention_mask.clone()

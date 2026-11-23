@@ -119,6 +119,18 @@ python evaluate_dpo_sonnet.py --use_gpu \
 Judge 模型可通过
 `--judge_model` 指定，更多参数见各脚本的 `--help`。
 
+### 格式感知 SFT 与离线评测
+
+[2026-11-23 后训练实验](docs/sonnet_post_training_2026-11-23.md)记录了 Medium SFT、DPO 重训和换行加权的对照。
+
+`sonnet_generation.py` 的 `--format_aware_sft` 仅使用恰好 14 个非空行的 129 首训练诗，并将结尾 EOS 纳入训练损失。CUDA 环境可通过 `--bf16` 启用训练混合精度。`--first_continuation_weight` 可在损失中加权每首诗的首个续写 token，本轮数据的该 token 均为换行。不同训练条件各用一个工作目录，方便保留各自的 checkpoint。
+
+离线评测共用 Dev 提示、采样设置和随机种子，输出逐首生成结果、整诗 chrF、续写 chrF 和十四行达标率。将 GPT-2 tokenizer 和 small 权重放在 `gpt2_pretrained/`，medium 配置和权重放在 `gpt2-medium_pretrained/`。
+
+```bash
+python evaluate_sonnet_dev.py --use_gpu --base medium-base gpt2-medium --checkpoint medium-sft /path/to/sft.pt --out my_results/dev_comparison.json
+```
+
 # CS 224N Default Final Project: Build GPT-2
 
 This is the default final project for the Stanford CS 224N class. Please refer to the project handout on the course

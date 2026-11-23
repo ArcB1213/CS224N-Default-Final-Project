@@ -8,6 +8,7 @@ trains your SonnetGPT model and writes the required submission files.
 '''
 
 import argparse
+import math
 import os
 import random
 import torch
@@ -92,15 +93,12 @@ class SonnetGPT(nn.Module):
 
   def __init__(self, args):
     super().__init__()
-    local_path = f'{args.model_size}_pretrained'
-    model_name = local_path if os.path.isdir(local_path) else args.model_size
+    model_name = resolve_pretrained_model_path(args.model_size)
     self.gpt = GPT2Model.from_pretrained(model=model_name, d=args.d, l=args.l, num_heads=args.num_heads)
     self.tokenizer = GPT2Tokenizer.from_pretrained('gpt2_pretrained')
     self.tokenizer.pad_token = self.tokenizer.eos_token
 
-    # By default, fine-tune the full model. TODO: this is maybe not idea.
-    for param in self.gpt.parameters():
-      param.requires_grad = True
+    configure_trainable_params(self.gpt, getattr(args, 'train_last_layers', -1))
 
   def forward(self, input_ids, attention_mask):
     """
@@ -133,8 +131,8 @@ class SonnetGPT(nn.Module):
       if line_count > max_lines:
         break
 
-      logits_sequence = self.forward(token_ids, attention_mask)
-      logits_last_token = logits_sequence[:, -1, :] / temperature
+      last_token = self.gpt(input_ids=token_ids, attention_mask=attention_mask)['last_token']
+      logits_last_token = self.gpt.hidden_state_to_token(last_token) / temperature
       if line_count < max_lines:
         logits_last_token[:, self.tokenizer.eos_token_id] = float('-inf')
       apply_repetition_penalty(logits_last_token, token_ids, repetition_penalty)
@@ -183,6 +181,83 @@ def save_model(model, optimizer, args, filepath):
 
   torch.save(save_info, filepath)
   print(f"save the model to {filepath}")
+
+
+def infer_next_epoch_from_checkpoint(path):
+  filename = os.path.basename(path)
+  prefix = filename.split('_', 1)[0]
+  if prefix.isdigit():
+    return int(prefix) + 1
+  return 0
+
+
+def restore_rng_state(saved):
+  if 'system_rng' in saved:
+    random.setstate(saved['system_rng'])
+  if 'numpy_rng' in saved:
+    np.random.set_state(saved['numpy_rng'])
+  if 'torch_rng' in saved:
+    torch_rng = saved['torch_rng']
+    if isinstance(torch_rng, torch.Tensor):
+      torch_rng = torch_rng.cpu()
+    torch.random.set_rng_state(torch_rng)
+
+
+def canonical_model_size(model_size):
+  if model_size == 'gpt2-middle':
+    return 'gpt2-medium'
+  return model_size
+
+
+def resolve_pretrained_model_path(model_size):
+  canonical_size = canonical_model_size(model_size)
+  local_candidates = [
+    f'{model_size}_pretrained',
+    f'{canonical_size}_pretrained',
+    model_size,
+    canonical_size,
+  ]
+  for path in local_candidates:
+    if os.path.isdir(path):
+      return path
+  return canonical_size
+
+
+def configure_trainable_params(gpt, train_last_layers):
+  for param in gpt.parameters():
+    param.requires_grad = True
+
+  if train_last_layers < 0:
+    return
+
+  for param in gpt.parameters():
+    param.requires_grad = False
+
+  if train_last_layers > 0:
+    for layer in gpt.gpt_layers[-train_last_layers:]:
+      for param in layer.parameters():
+        param.requires_grad = True
+
+  for module in [gpt.word_embedding, gpt.final_layer_norm]:
+    for param in module.parameters():
+      param.requires_grad = True
+
+
+def count_trainable_params(model):
+  trainable = sum(param.numel() for param in model.parameters() if param.requires_grad)
+  total = sum(param.numel() for param in model.parameters())
+  return trainable, total
+
+
+def validate_training_args(args):
+  if args.max_grad_norm < 0:
+    raise ValueError("--max_grad_norm must be >= 0")
+  if args.weight_decay < 0:
+    raise ValueError("--weight_decay must be >= 0")
+  if args.train_last_layers > args.l:
+    raise ValueError(f"--train_last_layers cannot exceed the model depth ({args.l})")
+  if not math.isfinite(args.first_continuation_weight) or args.first_continuation_weight <= 0:
+    raise ValueError("--first_continuation_weight must be finite and positive.")
 
 
 def parse_float_list(value, fallback):
@@ -256,8 +331,11 @@ def evaluate_generation_grid(model, dev_dataset, args, device, temperatures, top
 def train(args):
   """Fine-tune GPT-2 for sonnet continuation."""
   device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
+  if args.bf16 and (device.type != 'cuda' or not torch.cuda.is_bf16_supported()):
+    raise ValueError("--bf16 requires --use_gpu and a CUDA GPU with bfloat16 support.")
   # Create the data and its corresponding datasets and dataloader.
-  sonnet_dataset = SonnetsDataset(args.sonnet_path)
+  sonnet_dataset = SonnetsDataset(args.sonnet_path, format_aware_sft=args.format_aware_sft)
+  print(f"Training sonnets: {len(sonnet_dataset)}")
   sonnet_dataloader = DataLoader(sonnet_dataset, shuffle=True, batch_size=args.batch_size,
                                  collate_fn=sonnet_dataset.collate_fn)
 
@@ -265,20 +343,37 @@ def train(args):
   dev_sonnet_dataset = SonnetsDataset(args.dev_held_out_sonnet_path)
 
   args = add_arguments(args)
+  validate_training_args(args)
   model = SonnetGPT(args)
   model = model.to(device)
+  trainable_params, total_params = count_trainable_params(model)
+  trainable_param_list = [param for param in model.parameters() if param.requires_grad]
+  print(f"Trainable parameters: {trainable_params:,} / {total_params:,}")
 
   lr = args.lr
-  optimizer = AdamW(model.parameters(), lr=lr)
+  optimizer = AdamW(
+    trainable_param_list,
+    lr=lr,
+    weight_decay=args.weight_decay
+  )
+  start_epoch = 0
+  if args.resume_checkpoint:
+    saved = torch.load(args.resume_checkpoint, weights_only=False, map_location=device)
+    model.load_state_dict(saved['model'])
+    optimizer.load_state_dict(saved['optim'])
+    restore_rng_state(saved)
+    start_epoch = args.start_epoch if args.start_epoch >= 0 else infer_next_epoch_from_checkpoint(args.resume_checkpoint)
+    print(f"Resumed training from {args.resume_checkpoint}; starting at epoch {start_epoch}.")
+
   temperatures = parse_float_list(args.temperature_grid, args.temperature)
   top_ps = parse_float_list(args.top_p_grid, args.top_p)
-  best_dev_chrf = None
+  best_dev_chrf = args.resume_best_chrf if args.resume_best_chrf >= 0 else None
   best_temperature = args.temperature
   best_top_p = args.top_p
-  best_checkpoint_path = None
+  best_checkpoint_path = args.resume_best_checkpoint if args.resume_best_checkpoint else None
 
   # Run for the specified number of epochs.
-  for epoch in range(args.epochs):
+  for epoch in range(start_epoch, args.epochs):
     model.train()
     train_loss = 0
     num_batches = 0
@@ -293,20 +388,26 @@ def train(args):
 
       # Compute the loss, gradients, and update the model's parameters.
       optimizer.zero_grad()
-      logits = model(b_ids, b_mask)
-      # Shift: logits predict next token, so align predictions with targets
-      shift_logits = logits[:, :-1].contiguous()  # [bs, seq_len-1, vocab]
-      shift_labels = b_ids[:, 1:].contiguous()     # [bs, seq_len-1]
-      shift_mask = b_target_mask[:, 1:].contiguous()  # ignore padding and the conditioning prompt
+      with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=args.bf16):
+        logits = model(b_ids, b_mask)
+        # Shift: logits predict next token, so align predictions with targets
+        shift_logits = logits[:, :-1].contiguous()  # [bs, seq_len-1, vocab]
+        shift_labels = b_ids[:, 1:].contiguous()     # [bs, seq_len-1]
+        shift_mask = b_target_mask[:, 1:].contiguous()  # ignore padding and the conditioning prompt
 
-      loss = F.cross_entropy(
-        rearrange(shift_logits, 'b t d -> (b t) d'),
-        shift_labels.flatten(),
-        reduction='none',
-      )
-      # Mask out padding positions before averaging
-      loss = (loss * shift_mask.flatten()).sum() / shift_mask.flatten().sum()
+        loss = F.cross_entropy(
+          rearrange(shift_logits, 'b t d -> (b t) d'),
+          shift_labels.flatten(),
+          reduction='none',
+        )
+        if args.first_continuation_weight != 1.0:
+          first_target = shift_mask.bool() & (shift_mask.cumsum(dim=1) == 1)
+          shift_mask = shift_mask.to(loss.dtype).masked_fill(first_target, args.first_continuation_weight)
+        # Normalize over supervised token weights only.
+        loss = (loss * shift_mask.flatten()).sum() / shift_mask.flatten().sum()
       loss.backward()
+      if args.max_grad_norm > 0:
+        torch.nn.utils.clip_grad_norm_(trainable_param_list, args.max_grad_norm)
       optimizer.step()
 
       train_loss += loss.item()
@@ -404,7 +505,18 @@ def get_args():
 
   parser.add_argument("--seed", type=int, default=11711)
   parser.add_argument("--epochs", type=int, default=10)
+  parser.add_argument("--resume_checkpoint", type=str, default="",
+                      help="Resume training from a saved sonnet checkpoint.")
+  parser.add_argument("--resume_best_checkpoint", type=str, default="",
+                      help="Existing best checkpoint to keep if resumed epochs do not improve dev chrF.")
+  parser.add_argument("--resume_best_chrf", type=float, default=-1.0,
+                      help="Existing best dev chrF to compare against when resuming.")
+  parser.add_argument("--start_epoch", type=int, default=-1,
+                      help="Override the resumed start epoch; defaults to inferring from checkpoint name.")
   parser.add_argument("--use_gpu", action='store_true')
+  parser.add_argument("--bf16", action='store_true', help="Use bfloat16 autocast for training on CUDA.")
+  parser.add_argument("--format_aware_sft", action='store_true',
+                      help="Train on 14-line sonnets and supervise an explicit end-of-sequence token.")
 
   # Generation parameters.
   parser.add_argument("--temperature", type=float, help="softmax temperature.", default=1.2)
@@ -418,13 +530,20 @@ def get_args():
   parser.add_argument("--max_sonnet_lines", type=int, default=14)
   parser.add_argument("--repetition_penalty", type=float, default=1.0)
   parser.add_argument("--no_repeat_ngram_size", type=int, default=0)
-  parser.add_argument("--eval_every", type=int, default=1)
+  parser.add_argument("--eval_every", type=int, default=1,
+                      help="Run dev generation every N epochs. Set 0 to skip per-epoch evaluation.")
   parser.add_argument("--dev_preview_count", type=int, default=2)
 
   parser.add_argument("--batch_size", help='The training batch size.', type=int, default=8)
   parser.add_argument("--lr", type=float, help="learning rate", default=1e-5)
+  parser.add_argument("--weight_decay", type=float, default=0.0)
+  parser.add_argument("--first_continuation_weight", type=float, default=1.0,
+                      help="Relative loss weight of the first supervised continuation token.")
+  parser.add_argument("--max_grad_norm", type=float, default=1.0)
+  parser.add_argument("--train_last_layers", type=int, default=-1,
+                      help="Fine-tune only the last N GPT layers plus word embedding/final LN; -1 trains all layers.")
   parser.add_argument("--model_size", type=str, help="The model size as specified on hugging face.",
-                      choices=['gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'], default='gpt2')
+                      choices=['gpt2', 'gpt2-medium', 'gpt2-middle', 'gpt2-large', 'gpt2-xl'], default='gpt2')
 
   args = parser.parse_args()
   return args
@@ -432,15 +551,16 @@ def get_args():
 
 def add_arguments(args):
   """Add arguments that are deterministic on model size."""
-  if args.model_size == 'gpt2':
+  model_size = canonical_model_size(args.model_size)
+  if model_size == 'gpt2':
     args.d = 768
     args.l = 12
     args.num_heads = 12
-  elif args.model_size == 'gpt2-medium':
+  elif model_size == 'gpt2-medium':
     args.d = 1024
     args.l = 24
     args.num_heads = 16
-  elif args.model_size == 'gpt2-large':
+  elif model_size == 'gpt2-large':
     args.d = 1280
     args.l = 36
     args.num_heads = 20
